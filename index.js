@@ -1,4 +1,4 @@
-// index.js - Jarvas Redis-backed memory API (persistent)
+// index.js - Jarvas Redis-backed memory API (persistent, JSON-safe)
 
 require("dotenv").config();
 const express = require("express");
@@ -20,9 +20,7 @@ if (!API_KEY) {
 
 function checkApiKey(req, res, next) {
   const headerKey = req.headers["x-api-key"];
-  if (headerKey !== API_KEY) {
-    return res.status(401).json({ error: "invalid api key" });
-  }
+  if (headerKey !== API_KEY) return res.status(401).json({ error: "invalid api key" });
   next();
 }
 
@@ -35,20 +33,32 @@ if (!REDIS_URL) {
 
 const redis = createClient({
   url: REDIS_URL,
-  socket: {
-    reconnectStrategy: (retries) => Math.min(retries * 200, 2000),
-  },
+  socket: { reconnectStrategy: (retries) => Math.min(retries * 200, 2000) },
 });
 
-redis.on("error", (err) => {
-  console.error("Redis error:", err);
-});
+redis.on("error", (err) => console.error("Redis error:", err));
 
 function userHashKey(userId) {
   return `jarvas:${userId || "zach"}`; // one hash per user
 }
 
-// Health
+// JSON helpers (so arrays/objects survive)
+function encodeValue(v) {
+  // store EVERYTHING as JSON so round-trips keep types
+  return JSON.stringify(v === undefined ? null : v);
+}
+
+function decodeValue(s) {
+  if (s == null) return null;
+  try {
+    return JSON.parse(s);
+  } catch {
+    // fallback for older values that weren't JSON-stringified
+    return s;
+  }
+}
+
+// Health (no auth)
 app.get("/healthz", async (req, res) => {
   try {
     const pong = await redis.ping();
@@ -62,11 +72,13 @@ app.get("/healthz", async (req, res) => {
 app.get("/get_memory", checkApiKey, async (req, res) => {
   const userId = req.query.user_id || "zach";
   try {
-    const hash = await redis.hGetAll(userHashKey(userId)); // { field: value, ... }
-    const memories = Object.entries(hash).map(([key, value]) => ({ key, value }));
+    const hash = await redis.hGetAll(userHashKey(userId)); // { field: string, ... }
+    const memories = Object.entries(hash).map(([key, raw]) => ({
+      key,
+      value: decodeValue(raw),
+    }));
     res.json({ user_id: userId, memories });
   } catch (e) {
-    // IMPORTANT: do not return empty; fail closed
     console.error("get_memory failed:", e);
     res.status(503).json({ error: "memory store unavailable" });
   }
@@ -78,7 +90,7 @@ app.post("/save_memory", checkApiKey, async (req, res) => {
   if (!key) return res.status(400).json({ error: "key is required" });
 
   try {
-    await redis.hSet(userHashKey(user_id), key, value ?? "");
+    await redis.hSet(userHashKey(user_id), key, encodeValue(value));
     res.json({ status: "ok" });
   } catch (e) {
     console.error("save_memory failed:", e);
