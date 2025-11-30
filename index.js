@@ -1,43 +1,22 @@
-// index.js - Jarvas file-based memory API
+// index.js - Jarvas Redis-backed memory API (persistent)
 
 require("dotenv").config();
 const express = require("express");
-const fs = require("fs");
 const cors = require("cors");
+const { createClient } = require("redis");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 app.use(cors());
 
-// Where we store long-term memory
-const MEMORY_FILE = "./memory.json";
+const PORT = process.env.PORT || 3000;
 
-// Load memory from disk
-function loadMemory() {
-  try {
-    if (!fs.existsSync(MEMORY_FILE)) {
-      return {};
-    }
-    const text = fs.readFileSync(MEMORY_FILE, "utf8");
-    if (!text.trim()) return {};
-    return JSON.parse(text);
-  } catch (err) {
-    console.error("Error loading memory:", err);
-    return {};
-  }
+// --- Security ---
+const API_KEY = process.env.MEMORY_API_KEY;
+if (!API_KEY) {
+  console.error("❌ MEMORY_API_KEY is missing. Refusing to start.");
+  process.exit(1);
 }
-
-// Save memory to disk
-function saveMemory(data) {
-  try {
-    fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error("Error saving memory:", err);
-  }
-}
-
-// Simple API key protection
-const API_KEY = process.env.MEMORY_API_KEY || "supersecret";
 
 function checkApiKey(req, res, next) {
   const headerKey = req.headers["x-api-key"];
@@ -47,67 +26,88 @@ function checkApiKey(req, res, next) {
   next();
 }
 
+// --- Redis ---
+const REDIS_URL = process.env.REDIS_URL;
+if (!REDIS_URL) {
+  console.error("❌ REDIS_URL is missing. Refusing to start.");
+  process.exit(1);
+}
+
+const redis = createClient({
+  url: REDIS_URL,
+  socket: {
+    reconnectStrategy: (retries) => Math.min(retries * 200, 2000),
+  },
+});
+
+redis.on("error", (err) => {
+  console.error("Redis error:", err);
+});
+
+function userHashKey(userId) {
+  return `jarvas:${userId || "zach"}`; // one hash per user
+}
+
+// Health
+app.get("/healthz", async (req, res) => {
+  try {
+    const pong = await redis.ping();
+    res.json({ ok: true, redis: pong });
+  } catch (e) {
+    res.status(503).json({ ok: false, error: "redis unavailable" });
+  }
+});
+
 // GET /get_memory?user_id=zach
-app.get("/get_memory", checkApiKey, (req, res) => {
+app.get("/get_memory", checkApiKey, async (req, res) => {
   const userId = req.query.user_id || "zach";
-
-  const store = loadMemory();
-  const userMem = store[userId] || {};
-
-  const memories = Object.entries(userMem).map(([key, value]) => ({
-    key,
-    value,
-  }));
-
-  res.json({ user_id: userId, memories });
+  try {
+    const hash = await redis.hGetAll(userHashKey(userId)); // { field: value, ... }
+    const memories = Object.entries(hash).map(([key, value]) => ({ key, value }));
+    res.json({ user_id: userId, memories });
+  } catch (e) {
+    // IMPORTANT: do not return empty; fail closed
+    console.error("get_memory failed:", e);
+    res.status(503).json({ error: "memory store unavailable" });
+  }
 });
 
 // POST /save_memory  { user_id, key, value }
-app.post("/save_memory", checkApiKey, (req, res) => {
-  const { user_id = "zach", key, value } = req.body;
+app.post("/save_memory", checkApiKey, async (req, res) => {
+  const { user_id = "zach", key, value } = req.body || {};
+  if (!key) return res.status(400).json({ error: "key is required" });
 
-  if (!key) {
-    return res.status(400).json({ error: "key is required" });
+  try {
+    await redis.hSet(userHashKey(user_id), key, value ?? "");
+    res.json({ status: "ok" });
+  } catch (e) {
+    console.error("save_memory failed:", e);
+    res.status(503).json({ error: "memory store unavailable" });
   }
-
-  const store = loadMemory();
-  if (!store[user_id]) {
-    store[user_id] = {};
-  }
-
-  store[user_id][key] = value;
-  saveMemory(store);
-
-  res.json({ status: "ok" });
 });
 
 // POST /delete_memory  { user_id, key }
-app.post("/delete_memory", checkApiKey, (req, res) => {
-  const { user_id = "zach", key } = req.body;
+app.post("/delete_memory", checkApiKey, async (req, res) => {
+  const { user_id = "zach", key } = req.body || {};
+  if (!key) return res.status(400).json({ error: "key is required" });
 
-  if (!key) {
-    return res.status(400).json({ error: "key is required" });
+  try {
+    await redis.hDel(userHashKey(user_id), key);
+    res.json({ status: "ok" });
+  } catch (e) {
+    console.error("delete_memory failed:", e);
+    res.status(503).json({ error: "memory store unavailable" });
   }
-
-  const store = loadMemory();
-
-  if (!store[user_id]) {
-    return res.json({ status: "ok", message: "no memory for user" });
-  }
-
-  delete store[user_id][key];
-
-  // If user has no more keys, remove the user entirely
-  if (Object.keys(store[user_id]).length === 0) {
-    delete store[user_id];
-  }
-
-  saveMemory(store);
-  res.json({ status: "ok" });
 });
 
-// Start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Jarvas Memory API running on port ${PORT}`);
-});
+// Start
+(async () => {
+  try {
+    await redis.connect();
+    console.log("✅ Connected to Redis");
+    app.listen(PORT, () => console.log(`Jarvas Memory API running on port ${PORT}`));
+  } catch (e) {
+    console.error("❌ Failed to connect to Redis. Refusing to start.", e);
+    process.exit(1);
+  }
+})();
