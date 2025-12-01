@@ -1,4 +1,6 @@
-// index.js - Jarvas Redis-backed memory API (persistent, JSON-safe, bot-forgiving, wipe-resistant)
+// index.js - Jarvas Redis-backed memory API
+// Persistent (Redis), JSON-safe, bot-forgiving, wipe-resistant,
+// PLUS role-based access control (Admin vs Coach) so clients can't read Zach's memory.
 
 require("dotenv").config();
 const express = require("express");
@@ -12,18 +14,47 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 
 // =====================
-// Security
+// Security / Auth (Admin vs Coach keys)
 // =====================
-const API_KEY = process.env.MEMORY_API_KEY;
-if (!API_KEY) {
-  console.error("❌ MEMORY_API_KEY is missing. Refusing to start.");
+const ADMIN_KEY = process.env.MEMORY_API_KEY_ADMIN;
+const COACH_KEY = process.env.MEMORY_API_KEY_COACH;
+
+if (!ADMIN_KEY || !COACH_KEY) {
+  console.error("❌ MEMORY_API_KEY_ADMIN or MEMORY_API_KEY_COACH missing. Refusing to start.");
   process.exit(1);
 }
 
 function checkApiKey(req, res, next) {
   const headerKey = req.headers["x-api-key"];
-  if (headerKey !== API_KEY) return res.status(401).json({ error: "invalid api key" });
+  if (headerKey === ADMIN_KEY) req.role = "admin";
+  else if (headerKey === COACH_KEY) req.role = "coach";
+  else return res.status(401).json({ error: "invalid api key" });
   next();
+}
+
+// Coach key restrictions:
+// - cannot access user_id "zach"
+// - must use user_id that starts with "client:"
+// - cannot access admin-only keys (even inside client namespace)
+const ADMIN_ONLY_KEYS = new Set(["training_clients"]);
+
+function assertAllowed(req, userId, keyOrNull) {
+  if (req.role === "admin") return;
+
+  const uid = String(userId || "");
+  if (uid === "zach") {
+    throw new Error("forbidden: coach key cannot access zach");
+  }
+  if (!uid.startsWith("client:")) {
+    throw new Error('forbidden: coach user_id must start with "client:"');
+  }
+
+  if (keyOrNull != null) {
+    const k = String(keyOrNull);
+    if (ADMIN_ONLY_KEYS.has(k)) {
+      throw new Error(`forbidden: key "${k}" is admin-only`);
+    }
+  }
 }
 
 // =====================
@@ -45,21 +76,18 @@ redis.on("error", (err) => console.error("Redis error:", err));
 function userHashKey(userId) {
   return `jarvas:${userId || "zach"}`; // one hash per user
 }
-
 function trashHashKey(userId) {
-  return `jarvas_trash:${userId || "zach"}`; // soft-deleted values
+  return `jarvas_trash:${userId || "zach"}`;
 }
-
 function trashMetaKey(userId) {
-  return `jarvas_trash_meta:${userId || "zach"}`; // timestamps for deletes
+  return `jarvas_trash_meta:${userId || "zach"}`;
 }
-
 function historyListKey(userId, key) {
-  return `jarvas_hist:${userId || "zach"}:${key}`; // version history per key
+  return `jarvas_hist:${userId || "zach"}:${key}`;
 }
 
 // =====================
-// JSON helpers (arrays/objects survive; also tolerate JSON-as-string)
+// JSON helpers
 // =====================
 function encodeValue(v) {
   return JSON.stringify(v === undefined ? null : v);
@@ -94,8 +122,6 @@ function decodeValue(s) {
 // =====================
 // Wipe-proof guardrails
 // =====================
-
-// Keys we really don't want accidentally wiped
 const PROTECTED_KEYS = new Set([
   "reminders",
   "meetings",
@@ -120,7 +146,7 @@ async function pushHistoryIfExists(userId, key) {
 
   const entry = JSON.stringify({
     ts: new Date().toISOString(),
-    prev_raw: prevRaw, // raw stored string (JSON-stringified)
+    prev_raw: prevRaw, // raw stored string
   });
 
   const histKey = historyListKey(userId, key);
@@ -129,8 +155,12 @@ async function pushHistoryIfExists(userId, key) {
   await redis.expire(histKey, 60 * 60 * 24 * 30); // 30 days
 }
 
+function isForbiddenError(e) {
+  return String(e?.message || "").startsWith("forbidden:");
+}
+
 // =====================
-// Health (no auth)
+// Health (no auth) - OK to keep public
 // =====================
 app.get("/healthz", async (req, res) => {
   try {
@@ -142,14 +172,16 @@ app.get("/healthz", async (req, res) => {
 });
 
 // =====================
-// GET /get_memory?user_id=zach[&format=list|map]
+// GET /get_memory?user_id=...&format=list|map
 // =====================
 app.get("/get_memory", checkApiKey, async (req, res) => {
   const userId = req.query.user_id || "zach";
   const format = String(req.query.format || "list").toLowerCase(); // list | map
 
   try {
-    const hash = await redis.hGetAll(userHashKey(userId)); // { field: string, ... }
+    assertAllowed(req, userId, null);
+
+    const hash = await redis.hGetAll(userHashKey(userId));
 
     const data = {};
     const memories = [];
@@ -163,16 +195,15 @@ app.get("/get_memory", checkApiKey, async (req, res) => {
     if (format === "map") return res.json({ user_id: userId, data });
     return res.json({ user_id: userId, memories });
   } catch (e) {
+    if (isForbiddenError(e)) return res.status(403).json({ error: e.message });
     console.error("get_memory failed:", e);
     res.status(503).json({ error: "memory store unavailable" });
   }
 });
 
 // =====================
-// POST /save_memory  { user_id, key, value }
-// Guardrails:
-// - blocks empty overwrites on protected keys unless ?force=true
-// - saves history before overwriting
+// POST /save_memory?force=true|false
+// Body: { user_id, key, value }
 // =====================
 app.post("/save_memory", checkApiKey, async (req, res) => {
   const { user_id = "zach", key, value } = req.body || {};
@@ -181,9 +212,11 @@ app.post("/save_memory", checkApiKey, async (req, res) => {
   const force = String(req.query.force || "false").toLowerCase() === "true";
 
   try {
+    assertAllowed(req, user_id, key);
+
     const normalized = maybeParseJsonString(value);
 
-    if (PROTECTED_KEYS.has(key) && isEmptyValue(normalized) && !force) {
+    if (PROTECTED_KEYS.has(String(key)) && isEmptyValue(normalized) && !force) {
       return res.status(400).json({
         error: `Refusing empty overwrite for protected key "${key}". Use ?force=true if intentional.`,
       });
@@ -194,30 +227,30 @@ app.post("/save_memory", checkApiKey, async (req, res) => {
 
     res.json({ status: "ok" });
   } catch (e) {
+    if (isForbiddenError(e)) return res.status(403).json({ error: e.message });
     console.error("save_memory failed:", e);
     res.status(503).json({ error: "memory store unavailable" });
   }
 });
 
 // =====================
-// POST /delete_memory  { user_id, key }
-// Soft delete:
-// - moves value to trash hash (30-day TTL)
-// - keeps history
+// POST /delete_memory
+// Body: { user_id, key }
+// Soft-deletes to trash (30 days), records history
 // =====================
 app.post("/delete_memory", checkApiKey, async (req, res) => {
   const { user_id = "zach", key } = req.body || {};
   if (!key) return res.status(400).json({ error: "key is required" });
 
   try {
-    const hashKey = userHashKey(user_id);
+    assertAllowed(req, user_id, key);
 
+    const hashKey = userHashKey(user_id);
     const prevRaw = await redis.hGet(hashKey, key);
     if (prevRaw == null) return res.json({ status: "ok", note: "key not found" });
 
     await pushHistoryIfExists(user_id, key);
 
-    // Move into trash (store raw string for exact restore)
     await redis.hSet(trashHashKey(user_id), key, prevRaw);
     await redis.hSet(
       trashMetaKey(user_id),
@@ -225,7 +258,6 @@ app.post("/delete_memory", checkApiKey, async (req, res) => {
       JSON.stringify({ deleted_at: new Date().toISOString() })
     );
 
-    // Trash expires in 30 days
     await redis.expire(trashHashKey(user_id), 60 * 60 * 24 * 30);
     await redis.expire(trashMetaKey(user_id), 60 * 60 * 24 * 30);
 
@@ -233,20 +265,23 @@ app.post("/delete_memory", checkApiKey, async (req, res) => {
 
     res.json({ status: "ok", soft_deleted: true });
   } catch (e) {
+    if (isForbiddenError(e)) return res.status(403).json({ error: e.message });
     console.error("delete_memory failed:", e);
     res.status(503).json({ error: "memory store unavailable" });
   }
 });
 
 // =====================
-// POST /restore_memory  { user_id, key }
-// Restores a soft-deleted key from trash
+// POST /restore_memory
+// Body: { user_id, key }
 // =====================
 app.post("/restore_memory", checkApiKey, async (req, res) => {
   const { user_id = "zach", key } = req.body || {};
   if (!key) return res.status(400).json({ error: "key is required" });
 
   try {
+    assertAllowed(req, user_id, key);
+
     const raw = await redis.hGet(trashHashKey(user_id), key);
     if (raw == null) return res.status(404).json({ error: "no trash entry for key" });
 
@@ -258,14 +293,14 @@ app.post("/restore_memory", checkApiKey, async (req, res) => {
 
     res.json({ status: "ok", restored: true });
   } catch (e) {
+    if (isForbiddenError(e)) return res.status(403).json({ error: e.message });
     console.error("restore_memory failed:", e);
     res.status(503).json({ error: "memory store unavailable" });
   }
 });
 
 // =====================
-// GET /history?user_id=zach&key=reminders&limit=10
-// Returns last versions (raw) for undo/debug
+// GET /history?user_id=...&key=...&limit=...
 // =====================
 app.get("/history", checkApiKey, async (req, res) => {
   const userId = req.query.user_id || "zach";
@@ -275,15 +310,20 @@ app.get("/history", checkApiKey, async (req, res) => {
   if (!key) return res.status(400).json({ error: "key is required" });
 
   try {
+    assertAllowed(req, userId, key);
+
     const entries = await redis.lRange(historyListKey(userId, key), 0, limit - 1);
     res.json({ status: "ok", user_id: userId, key, entries: entries.map((s) => JSON.parse(s)) });
   } catch (e) {
+    if (isForbiddenError(e)) return res.status(403).json({ error: e.message });
     console.error("history failed:", e);
     res.status(503).json({ error: "memory store unavailable" });
   }
 });
 
+// =====================
 // Start
+// =====================
 (async () => {
   try {
     await redis.connect();
