@@ -68,16 +68,29 @@ app.get("/healthz", async (req, res) => {
   }
 });
 
-// GET /get_memory?user_id=zach
+// GET /get_memory?user_id=zach[&format=list|map]
 app.get("/get_memory", checkApiKey, async (req, res) => {
   const userId = req.query.user_id || "zach";
+  const format = String(req.query.format || "list").toLowerCase(); // list | map
+
   try {
     const hash = await redis.hGetAll(userHashKey(userId)); // { field: string, ... }
-    const memories = Object.entries(hash).map(([key, raw]) => ({
-      key,
-      value: decodeValue(raw),
-    }));
-    res.json({ user_id: userId, memories });
+
+    const data = {};
+    const memories = [];
+
+    for (const [key, raw] of Object.entries(hash)) {
+      const value = decodeValue(raw);
+      data[key] = value;
+      memories.push({ key, value });
+    }
+
+    if (format === "map") {
+      return res.json({ user_id: userId, data });
+    }
+
+    // default/backward-compatible
+    return res.json({ user_id: userId, memories });
   } catch (e) {
     console.error("get_memory failed:", e);
     res.status(503).json({ error: "memory store unavailable" });
