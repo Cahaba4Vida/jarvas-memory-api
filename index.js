@@ -1,4 +1,4 @@
-// index.js - Jarvas Redis-backed memory API (persistent, JSON-safe)
+// index.js - Jarvas Redis-backed memory API (persistent, JSON-safe, bot-forgiving)
 
 require("dotenv").config();
 const express = require("express");
@@ -48,13 +48,32 @@ function encodeValue(v) {
   return JSON.stringify(v === undefined ? null : v);
 }
 
+function maybeParseJsonString(v) {
+  // Some callers may send arrays/objects as JSON strings. Normalize on write/read.
+  if (typeof v !== "string") return v;
+  const t = v.trim();
+  if (
+    (t.startsWith("{") && t.endsWith("}")) ||
+    (t.startsWith("[") && t.endsWith("]"))
+  ) {
+    try {
+      return JSON.parse(t);
+    } catch {
+      return v;
+    }
+  }
+  return v;
+}
+
 function decodeValue(s) {
   if (s == null) return null;
   try {
-    return JSON.parse(s);
+    const parsed = JSON.parse(s);
+    // If the parsed value is itself a JSON-string, normalize it too (double-encoding cleanup)
+    return maybeParseJsonString(parsed);
   } catch {
     // fallback for older values that weren't JSON-stringified
-    return s;
+    return maybeParseJsonString(s);
   }
 }
 
@@ -103,7 +122,10 @@ app.post("/save_memory", checkApiKey, async (req, res) => {
   if (!key) return res.status(400).json({ error: "key is required" });
 
   try {
-    await redis.hSet(userHashKey(user_id), key, encodeValue(value));
+    // Normalize JSON-looking strings so arrays/objects don't get stored as plain strings
+    const normalized = maybeParseJsonString(value);
+
+    await redis.hSet(userHashKey(user_id), key, encodeValue(normalized));
     res.json({ status: "ok" });
   } catch (e) {
     console.error("save_memory failed:", e);
