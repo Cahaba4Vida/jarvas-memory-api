@@ -61,6 +61,9 @@ if (!ADMIN_KEY || !COACH_KEY || !JWT_SECRET) {
 const OTP_TTL_SECONDS = Math.max(Number(process.env.OTP_TTL_SECONDS || 600), 60); // default 10m
 const JWT_TTL_DAYS = Math.max(Number(process.env.JWT_TTL_DAYS || 30), 1);
 const OTP_DEV_MODE = String(process.env.OTP_DEV_MODE || "false").toLowerCase() === "true";
+const ALLOW_PHONE_LOGIN_NO_OTP =
+  String(process.env.ALLOW_PHONE_LOGIN_NO_OTP || "false").toLowerCase() === "true";
+
 
 // ---------- Redis ----------
 const REDIS_URL = process.env.REDIS_URL;
@@ -398,6 +401,30 @@ app.post("/auth/verify_otp", async (req, res) => {
   );
 
   res.json({ status: "ok", token });
+});
+// OPTIONAL: phone-only login (no OTP) — enable with ALLOW_PHONE_LOGIN_NO_OTP=true
+app.post("/auth/phone_login", async (req, res) => {
+  if (!ALLOW_PHONE_LOGIN_NO_OTP) {
+    return res.status(403).json({ error: "phone_login disabled by config" });
+  }
+
+  const phone10 = normalizePhone(req.body?.phone);
+  if (!phone10) {
+    return res.status(400).json({ error: "invalid phone (need 10 digits)" });
+  }
+
+  try {
+    const token = jwt.sign(
+      { role: "client", sub: phone10 },
+      JWT_SECRET,
+      { expiresIn: `${JWT_TTL_DAYS}d` }
+    );
+
+    return res.json({ status: "ok", token });
+  } catch (e) {
+    console.error("/auth/phone_login failed:", e);
+    return res.status(503).json({ error: "token generation failed" });
+  }
 });
 
 // ============================================================================
