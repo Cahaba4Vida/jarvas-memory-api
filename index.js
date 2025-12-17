@@ -573,6 +573,89 @@ function requireAdminApiKey(req, res, next) {
 }
 
 // List roster
+// ============================================================================
+// PROGRAM UPSERT (one-week-at-a-time) — require Bearer JWT (client-scoped)
+// ============================================================================
+//
+// Purpose:
+// - Enable full day-level persistence without giant single writes.
+// - Only affects the logged-in client (req.clientUserId).
+// - Replaces exactly one week inside program_current.weeks[weekNumber-1].
+//
+// Body:
+//   { "week": { ...fullWeekObject... } }
+//
+// Requirements (for full persistence):
+// - week.days must be a non-empty array
+// - weekNumber must be an integer 1..52
+//
+app.put("/me/program/week/:weekNumber", requireClientJwt, async (req, res) => {
+  const nowIso = new Date().toISOString();
+
+  const weekNumber = parseInt(String(req.params.weekNumber || ""), 10);
+  if (!Number.isInteger(weekNumber) || weekNumber < 1 || weekNumber > 52) {
+    return res.status(400).json({ error: "weekNumber must be an integer between 1 and 52" });
+  }
+
+  const weekObj = req.body?.week;
+  if (!weekObj || typeof weekObj !== "object" || Array.isArray(weekObj)) {
+    return res.status(400).json({ error: 'body must be { "week": { ... } }' });
+  }
+
+  // Enforce day-level persistence
+  if (!Array.isArray(weekObj.days) || weekObj.days.length === 0) {
+    return res.status(400).json({ error: "week.days must be a non-empty array" });
+  }
+
+  // Optional consistency check
+  if (weekObj.week != null && Number(weekObj.week) !== weekNumber) {
+    return res.status(400).json({ error: "week.week must match :weekNumber" });
+  }
+
+  try {
+    const existing = await readClientMap(req.clientUserId);
+    const program = existing.program_current;
+
+    if (!program || typeof program !== "object" || Array.isArray(program)) {
+      return res.status(400).json({
+        error: "program_current not found; create program shell first (PATCH /me with program_current)",
+      });
+    }
+
+    if (!Array.isArray(program.weeks)) program.weeks = [];
+
+    const weeksTotal = Number(program.weeks_total || 0);
+    if (weeksTotal > 0 && weekNumber > weeksTotal) {
+      return res.status(400).json({ error: `weekNumber exceeds weeks_total (${weeksTotal})` });
+    }
+
+    const targetLen = Math.max(program.weeks.length, weeksTotal || 0, weekNumber);
+    while (program.weeks.length < targetLen) program.weeks.push(null);
+
+    const normalizedWeek = {
+      ...weekObj,
+      week: weekNumber,
+      updated_at: nowIso,
+    };
+
+    program.weeks[weekNumber - 1] = normalizedWeek;
+    program.updated_at = nowIso;
+
+    await writeClientKeys(req.clientUserId, { program_current: program });
+
+    return res.json({
+      status: "ok",
+      message: `Week ${weekNumber} saved`,
+      weekNumber,
+      daysCount: normalizedWeek.days.length,
+    });
+  } catch (e) {
+    console.error("PUT /me/program/week failed:", e);
+    return res.status(503).json({ error: "memory store unavailable" });
+  }
+});
+
+
 app.get("/admin/clients", requireAdminApiKey, async (req, res) => {
   try {
     const raw = await redis.hGet(userHashKey("zach"), "training_clients");
