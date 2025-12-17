@@ -31,7 +31,7 @@ const { createClient } = require("redis");
 
 const app = express();
 app.set("trust proxy", 1);
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 // ---------- CORS ----------
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
