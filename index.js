@@ -13,12 +13,8 @@ app.use(express.json({ limit: "10mb" }));
 // -------------------------
 // ENV / CONFIG
 // -------------------------
-const {
-  REDIS_URL,
-  MEMORY_API_KEY_ADMIN,
-  MEMORY_API_KEY_COACH,
-  PORT,
-} = process.env;
+const { REDIS_URL, MEMORY_API_KEY_ADMIN, MEMORY_API_KEY_COACH, PORT } =
+  process.env;
 
 const REQUIRED = ["REDIS_URL", "MEMORY_API_KEY_ADMIN", "MEMORY_API_KEY_COACH"];
 const missing = REQUIRED.filter((k) => !process.env[k]);
@@ -100,12 +96,19 @@ function requireApiKey(req, res, next) {
 }
 
 // -------------------------
-// AUTH: CLIENT SESSION (x-session-key)
+// AUTH: CLIENT SESSION
 // -------------------------
+// IMPORTANT CHANGE:
+// Accept session key from either header OR query param.
+// This is needed because ChatGPT Actions is unreliable with dynamic headers.
 async function requireClientSession(req, res, next) {
   try {
     await ensureRedis();
-    const sk = req.header("x-session-key");
+
+    const sk =
+      req.header("x-session-key") ||
+      (req.query?.session_key ? String(req.query.session_key) : "");
+
     if (!sk) return res.status(401).json({ error: "missing_session_key" });
 
     const uid = await redis.get(`${SESSION_PREFIX}${sk}`);
@@ -235,10 +238,15 @@ app.post("/auth/login", async (req, res) => {
 });
 
 // Optional: logout (invalidate session)
+// Now supports either header x-session-key OR query ?session_key=...
 app.post("/auth/logout", async (req, res) => {
   try {
     await ensureRedis();
-    const sk = req.header("x-session-key");
+
+    const sk =
+      req.header("x-session-key") ||
+      (req.query?.session_key ? String(req.query.session_key) : "");
+
     if (!sk) return res.status(400).json({ error: "missing_session_key" });
 
     await redis.del(`${SESSION_PREFIX}${sk}`);
@@ -437,7 +445,7 @@ app.get("/history", requireApiKey, async (req, res) => {
 });
 
 // ============================================================================
-// CLIENT-SCOPED ENDPOINTS (/me/*) — require x-session-key
+// CLIENT-SCOPED ENDPOINTS (/me/*) — require session_key (header or query)
 // ============================================================================
 
 // Get current client memory (allowed keys only)
@@ -562,7 +570,12 @@ app.get("/me/program/status", requireClientSession, async (req, res) => {
     const full = await readUserMap(req.clientUserId);
     const p = full.program_current;
 
-    if (!p || typeof p !== "object" || Array.isArray(p) || !Array.isArray(p.weeks)) {
+    if (
+      !p ||
+      typeof p !== "object" ||
+      Array.isArray(p) ||
+      !Array.isArray(p.weeks)
+    ) {
       return res.json({ ready: false, reason: "no_program" });
     }
 
@@ -604,16 +617,22 @@ app.put("/me/program/week/:weekNumber", requireClientSession, async (req, res) =
     const program = full.program_current;
 
     if (!program || typeof program !== "object" || Array.isArray(program)) {
-      return res.status(400).json({ error: "program_current_not_found_create_shell_first" });
+      return res.status(400).json({
+        error: "program_current_not_found_create_shell_first",
+      });
     }
 
     // Enforce Phase 1: weeks_total must be set before persisting weeks
     const weeksTotal = Number(program.weeks_total || 0);
     if (!weeksTotal) {
-      return res.status(400).json({ error: "weeks_total_not_set_create_shell_first" });
+      return res
+        .status(400)
+        .json({ error: "weeks_total_not_set_create_shell_first" });
     }
     if (weekNumber > weeksTotal) {
-      return res.status(400).json({ error: `weekNumber_exceeds_weeks_total_${weeksTotal}` });
+      return res
+        .status(400)
+        .json({ error: `weekNumber_exceeds_weeks_total_${weeksTotal}` });
     }
 
     if (!Array.isArray(program.weeks)) program.weeks = [];
@@ -625,7 +644,11 @@ app.put("/me/program/week/:weekNumber", requireClientSession, async (req, res) =
     program.weeks[weekNumber - 1] = normalized;
     program.updated_at = nowIso();
 
-    await writeUserKeys(req.clientUserId, { program_current: program }, "client_program_week_upsert");
+    await writeUserKeys(
+      req.clientUserId,
+      { program_current: program },
+      "client_program_week_upsert"
+    );
 
     return res.json({
       status: "ok",
