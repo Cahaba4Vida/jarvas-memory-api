@@ -2,7 +2,6 @@
 require("dotenv").config();
 
 const express = require("express");
-const crypto = require("crypto");
 const { createClient } = require("redis");
 
 const app = express();
@@ -25,10 +24,6 @@ if (missing.length) {
 
 const LIST_HISTORY = true;
 const HISTORY_LIST_KEY = "mem_history"; // admin-only
-
-// Session settings
-const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
-const SESSION_PREFIX = "sess:";
 
 // Only these keys are ever returned from /me (client bundle)
 const COACH_ALLOWED_KEYS = [
@@ -77,6 +72,12 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function normalizePhone(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (digits.length !== 10) return null;
+  return digits;
+}
+
 // -------------------------
 // AUTH: API KEY (admin/coach)
 // -------------------------
@@ -96,166 +97,22 @@ function requireApiKey(req, res, next) {
 }
 
 // -------------------------
-// AUTH: CLIENT SESSION
+// OPTION A: COACH-SCOPED CLIENT (PHONE REQUIRED)
 // -------------------------
-// IMPORTANT CHANGE:
-// Accept session key from either header OR query param.
-// This is needed because ChatGPT Actions is unreliable with dynamic headers.
-async function requireClientSession(req, res, next) {
-  try {
-    await ensureRedis();
-
-    const sk =
-      req.header("x-session-key") ||
-      (req.query?.session_key ? String(req.query.session_key) : "");
-
-    if (!sk) return res.status(401).json({ error: "missing_session_key" });
-
-    const uid = await redis.get(`${SESSION_PREFIX}${sk}`);
-    if (!uid) return res.status(401).json({ error: "invalid_session_key" });
-
-    if (typeof uid !== "string" || !uid.startsWith("client:")) {
-      return res.status(403).json({ error: "forbidden_session_subject" });
-    }
-
-    req.clientUserId = uid; // e.g. client:208...
-    req.sessionKey = sk;
-    return next();
-  } catch (e) {
-    console.error("requireClientSession failed:", e);
-    return res.status(503).json({ error: "memory_store_unavailable" });
+// For /me/* routes: require coach/admin API key AND a 10-digit phone query param.
+// This removes passcodes/sessions while keeping the API protected.
+function requireCoachPhone(req, res, next) {
+  if (req.apiRole !== "coach" && req.apiRole !== "admin") {
+    return res.status(403).json({ error: "forbidden_role" });
   }
+
+  const phone = normalizePhone(req.query?.phone);
+  if (!phone) return res.status(400).json({ error: "invalid_phone" });
+
+  req.clientUserId = `client:${phone}`;
+  req.clientPhone = phone;
+  return next();
 }
-
-// -------------------------
-// PASSCODE AUTH (NO SMS)
-// -------------------------
-// Stored under a private field in the user's Redis hash: "__auth_passcode"
-const AUTH_FIELD = "__auth_passcode";
-
-// PBKDF2 parameters
-const PASSCODE_ITER = 120000;
-const PASSCODE_KEYLEN = 32;
-const PASSCODE_DIGEST = "sha256";
-
-function pbkdf2Hash(passcode, saltHex) {
-  const salt = Buffer.from(saltHex, "hex");
-  const derived = crypto.pbkdf2Sync(
-    passcode,
-    salt,
-    PASSCODE_ITER,
-    PASSCODE_KEYLEN,
-    PASSCODE_DIGEST
-  );
-  return derived.toString("hex");
-}
-
-function normalizePhone(phone) {
-  const digits = String(phone || "").replace(/\D/g, "");
-  if (digits.length !== 10) return null;
-  return digits;
-}
-
-function newSessionKey() {
-  return crypto.randomBytes(32).toString("hex");
-}
-
-// Create/Update passcode for a phone (client can do this themselves)
-app.post("/auth/set_passcode", async (req, res) => {
-  try {
-    await ensureRedis();
-
-    const phone = normalizePhone(req.body?.phone);
-    const passcode = String(req.body?.passcode || "");
-
-    if (!phone) return res.status(400).json({ error: "invalid_phone" });
-    if (!passcode || passcode.length < 6) {
-      return res.status(400).json({ error: "passcode_too_short_min_6" });
-    }
-
-    const uid = `client:${phone}`;
-    const saltHex = crypto.randomBytes(16).toString("hex");
-    const hashHex = pbkdf2Hash(passcode, saltHex);
-
-    const authObj = {
-      v: 1,
-      iter: PASSCODE_ITER,
-      digest: PASSCODE_DIGEST,
-      salt: saltHex,
-      hash: hashHex,
-      updated_at: nowIso(),
-    };
-
-    await redis.hSet(userHashKey(uid), {
-      [AUTH_FIELD]: safeJsonStringify(authObj),
-    });
-
-    return res.json({ status: "ok", message: "passcode_set" });
-  } catch (e) {
-    console.error("POST /auth/set_passcode failed:", e);
-    return res.status(503).json({ error: "memory_store_unavailable" });
-  }
-});
-
-// Login: phone + passcode -> session_key (no JWT)
-app.post("/auth/login", async (req, res) => {
-  try {
-    await ensureRedis();
-
-    const phone = normalizePhone(req.body?.phone);
-    const passcode = String(req.body?.passcode || "");
-
-    if (!phone) return res.status(400).json({ error: "invalid_phone" });
-    if (!passcode) return res.status(400).json({ error: "missing_passcode" });
-
-    const uid = `client:${phone}`;
-    const h = await redis.hGet(userHashKey(uid), AUTH_FIELD);
-    if (!h) return res.status(401).json({ error: "passcode_not_set" });
-
-    const authObj = safeJsonParse(h);
-    if (!authObj?.salt || !authObj?.hash) {
-      return res.status(401).json({ error: "passcode_not_set" });
-    }
-
-    const attempt = pbkdf2Hash(passcode, authObj.salt);
-    const ok = crypto.timingSafeEqual(
-      Buffer.from(attempt, "hex"),
-      Buffer.from(authObj.hash, "hex")
-    );
-
-    if (!ok) return res.status(401).json({ error: "invalid_passcode" });
-
-    const session_key = newSessionKey();
-    await redis.set(`${SESSION_PREFIX}${session_key}`, uid, {
-      EX: SESSION_TTL_SECONDS,
-    });
-
-    return res.json({ session_key, expires_in_seconds: SESSION_TTL_SECONDS });
-  } catch (e) {
-    console.error("POST /auth/login failed:", e);
-    return res.status(503).json({ error: "memory_store_unavailable" });
-  }
-});
-
-// Optional: logout (invalidate session)
-// Now supports either header x-session-key OR query ?session_key=...
-app.post("/auth/logout", async (req, res) => {
-  try {
-    await ensureRedis();
-
-    const sk =
-      req.header("x-session-key") ||
-      (req.query?.session_key ? String(req.query.session_key) : "");
-
-    if (!sk) return res.status(400).json({ error: "missing_session_key" });
-
-    await redis.del(`${SESSION_PREFIX}${sk}`);
-    return res.json({ status: "ok", message: "logged_out" });
-  } catch (e) {
-    console.error("POST /auth/logout failed:", e);
-    return res.status(503).json({ error: "memory_store_unavailable" });
-  }
-});
 
 // -------------------------
 // MEMORY HELPERS (Redis hash per user)
@@ -265,7 +122,6 @@ async function readUserMap(userId) {
   const raw = await redis.hGetAll(userHashKey(userId));
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
-    if (k === AUTH_FIELD) continue; // never return auth field
     out[k] = safeJsonParse(v);
   }
   return out;
@@ -445,11 +301,11 @@ app.get("/history", requireApiKey, async (req, res) => {
 });
 
 // ============================================================================
-// CLIENT-SCOPED ENDPOINTS (/me/*) — require session_key (header or query)
+// COACH-SCOPED ENDPOINTS (/me/*) — Option A (x-api-key + ?phone=...)
 // ============================================================================
 
 // Get current client memory (allowed keys only)
-app.get("/me", requireClientSession, async (req, res) => {
+app.get("/me", requireApiKey, requireCoachPhone, async (req, res) => {
   try {
     const full = await readUserMap(req.clientUserId);
 
@@ -470,7 +326,7 @@ app.get("/me", requireClientSession, async (req, res) => {
 });
 
 // Returns today's date + ISO weekday in the client's timezone (or provided timezone)
-app.get("/me/today", requireClientSession, async (req, res) => {
+app.get("/me/today", requireApiKey, requireCoachPhone, async (req, res) => {
   try {
     const tzFromQuery = req.query?.timezone ? String(req.query.timezone) : null;
 
@@ -512,7 +368,7 @@ app.get("/me/today", requireClientSession, async (req, res) => {
 });
 
 // Initialize the client namespace (idempotent)
-app.post("/me/register", requireClientSession, async (req, res) => {
+app.post("/me/register", requireApiKey, requireCoachPhone, async (req, res) => {
   try {
     const full = await readUserMap(req.clientUserId);
 
@@ -531,7 +387,7 @@ app.post("/me/register", requireClientSession, async (req, res) => {
       notes: initial.notes || [],
     };
 
-    await writeUserKeys(req.clientUserId, defaults, "client_register");
+    await writeUserKeys(req.clientUserId, defaults, "coach_register");
     return res.json({ status: "ok", initialized: true });
   } catch (e) {
     console.error("POST /me/register failed:", e);
@@ -539,8 +395,8 @@ app.post("/me/register", requireClientSession, async (req, res) => {
   }
 });
 
-// Patch allowed keys for the logged-in client
-app.patch("/me", requireClientSession, async (req, res) => {
+// Patch allowed keys for the scoped client
+app.patch("/me", requireApiKey, requireCoachPhone, async (req, res) => {
   try {
     const updates = req.body?.updates;
     if (!updates || typeof updates !== "object" || Array.isArray(updates)) {
@@ -556,7 +412,7 @@ app.patch("/me", requireClientSession, async (req, res) => {
       return res.status(400).json({ error: "no_allowed_keys_in_updates" });
     }
 
-    await writeUserKeys(req.clientUserId, filtered, "client_patch");
+    await writeUserKeys(req.clientUserId, filtered, "coach_patch");
     return res.json({ status: "ok", updated: Object.keys(filtered) });
   } catch (e) {
     console.error("PATCH /me failed:", e);
@@ -565,101 +421,113 @@ app.patch("/me", requireClientSession, async (req, res) => {
 });
 
 // Program sync verification endpoint
-app.get("/me/program/status", requireClientSession, async (req, res) => {
-  try {
-    const full = await readUserMap(req.clientUserId);
-    const p = full.program_current;
+app.get(
+  "/me/program/status",
+  requireApiKey,
+  requireCoachPhone,
+  async (req, res) => {
+    try {
+      const full = await readUserMap(req.clientUserId);
+      const p = full.program_current;
 
-    if (
-      !p ||
-      typeof p !== "object" ||
-      Array.isArray(p) ||
-      !Array.isArray(p.weeks)
-    ) {
-      return res.json({ ready: false, reason: "no_program" });
+      if (
+        !p ||
+        typeof p !== "object" ||
+        Array.isArray(p) ||
+        !Array.isArray(p.weeks)
+      ) {
+        return res.json({ ready: false, reason: "no_program" });
+      }
+
+      const total = Number(p.weeks_total || 0);
+      const saved = p.weeks.filter(Boolean).length;
+
+      return res.json({
+        weeks_total: total,
+        weeks_saved: saved,
+        complete: total > 0 && saved === total,
+        updated_at: p.updated_at || null,
+      });
+    } catch (e) {
+      console.error("GET /me/program/status failed:", e);
+      return res.status(503).json({ error: "memory_store_unavailable" });
     }
-
-    const total = Number(p.weeks_total || 0);
-    const saved = p.weeks.filter(Boolean).length;
-
-    return res.json({
-      weeks_total: total,
-      weeks_saved: saved,
-      complete: total > 0 && saved === total,
-      updated_at: p.updated_at || null,
-    });
-  } catch (e) {
-    console.error("GET /me/program/status failed:", e);
-    return res.status(503).json({ error: "memory_store_unavailable" });
   }
-});
+);
 
 // Upsert a single week inside program_current (full day-level persistence)
-app.put("/me/program/week/:weekNumber", requireClientSession, async (req, res) => {
-  const weekNumber = parseInt(String(req.params.weekNumber || ""), 10);
-  if (!Number.isInteger(weekNumber) || weekNumber < 1 || weekNumber > 52) {
-    return res.status(400).json({ error: "weekNumber_must_be_1_to_52" });
-  }
+app.put(
+  "/me/program/week/:weekNumber",
+  requireApiKey,
+  requireCoachPhone,
+  async (req, res) => {
+    const weekNumber = parseInt(String(req.params.weekNumber || ""), 10);
+    if (!Number.isInteger(weekNumber) || weekNumber < 1 || weekNumber > 52) {
+      return res.status(400).json({ error: "weekNumber_must_be_1_to_52" });
+    }
 
-  const weekObj = req.body?.week;
-  if (!weekObj || typeof weekObj !== "object" || Array.isArray(weekObj)) {
-    return res.status(400).json({ error: 'body_must_be_{ "week": { ... } }' });
-  }
-  if (!Array.isArray(weekObj.days) || weekObj.days.length === 0) {
-    return res.status(400).json({ error: "week.days_must_be_non_empty_array" });
-  }
-  if (weekObj.week != null && Number(weekObj.week) !== weekNumber) {
-    return res.status(400).json({ error: "week.week_must_match_weekNumber" });
-  }
+    const weekObj = req.body?.week;
+    if (!weekObj || typeof weekObj !== "object" || Array.isArray(weekObj)) {
+      return res
+        .status(400)
+        .json({ error: 'body_must_be_{ "week": { ... } }' });
+    }
+    if (!Array.isArray(weekObj.days) || weekObj.days.length === 0) {
+      return res.status(400).json({ error: "week.days_must_be_non_empty_array" });
+    }
+    if (weekObj.week != null && Number(weekObj.week) !== weekNumber) {
+      return res.status(400).json({ error: "week.week_must_match_weekNumber" });
+    }
 
-  try {
-    const full = await readUserMap(req.clientUserId);
-    const program = full.program_current;
+    try {
+      const full = await readUserMap(req.clientUserId);
+      const program = full.program_current;
 
-    if (!program || typeof program !== "object" || Array.isArray(program)) {
-      return res.status(400).json({
-        error: "program_current_not_found_create_shell_first",
+      if (!program || typeof program !== "object" || Array.isArray(program)) {
+        return res.status(400).json({
+          error: "program_current_not_found_create_shell_first",
+        });
+      }
+
+      // Enforce Phase 1: weeks_total must be set before persisting weeks
+      const weeksTotal = Number(program.weeks_total || 0);
+      if (!weeksTotal) {
+        return res
+          .status(400)
+          .json({ error: "weeks_total_not_set_create_shell_first" });
+      }
+      if (weekNumber > weeksTotal) {
+        return res
+          .status(400)
+          .json({ error: `weekNumber_exceeds_weeks_total_${weeksTotal}` });
+      }
+
+      if (!Array.isArray(program.weeks)) program.weeks = [];
+
+      const targetLen = Math.max(program.weeks.length, weeksTotal, weekNumber);
+      while (program.weeks.length < targetLen) program.weeks.push(null);
+
+      const normalized = { ...weekObj, week: weekNumber, updated_at: nowIso() };
+      program.weeks[weekNumber - 1] = normalized;
+      program.updated_at = nowIso();
+
+      await writeUserKeys(
+        req.clientUserId,
+        { program_current: program },
+        "coach_program_week_upsert"
+      );
+
+      return res.json({
+        status: "ok",
+        weekNumber,
+        daysCount: normalized.days.length,
       });
+    } catch (e) {
+      console.error("PUT /me/program/week failed:", e);
+      return res.status(503).json({ error: "memory_store_unavailable" });
     }
-
-    // Enforce Phase 1: weeks_total must be set before persisting weeks
-    const weeksTotal = Number(program.weeks_total || 0);
-    if (!weeksTotal) {
-      return res
-        .status(400)
-        .json({ error: "weeks_total_not_set_create_shell_first" });
-    }
-    if (weekNumber > weeksTotal) {
-      return res
-        .status(400)
-        .json({ error: `weekNumber_exceeds_weeks_total_${weeksTotal}` });
-    }
-
-    if (!Array.isArray(program.weeks)) program.weeks = [];
-
-    const targetLen = Math.max(program.weeks.length, weeksTotal, weekNumber);
-    while (program.weeks.length < targetLen) program.weeks.push(null);
-
-    const normalized = { ...weekObj, week: weekNumber, updated_at: nowIso() };
-    program.weeks[weekNumber - 1] = normalized;
-    program.updated_at = nowIso();
-
-    await writeUserKeys(
-      req.clientUserId,
-      { program_current: program },
-      "client_program_week_upsert"
-    );
-
-    return res.json({
-      status: "ok",
-      weekNumber,
-      daysCount: normalized.days.length,
-    });
-  } catch (e) {
-    console.error("PUT /me/program/week failed:", e);
-    return res.status(503).json({ error: "memory_store_unavailable" });
   }
-});
+);
 
 // -------------------------
 // START
