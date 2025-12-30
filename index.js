@@ -1,10 +1,38 @@
+
 /* eslint-disable no-console */
 require("dotenv").config();
 
 const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
+const nodemailer = require("nodemailer");
 const { createClient } = require("redis");
 
 const app = express();
+
+// -------------------------
+// CORS (Portal + local dev)
+// -------------------------
+// Note: CORS only affects browser requests. Server-to-server calls are unaffected.
+const CORS_ALLOWLIST = new Set([
+  "https://appzachedwards.netlify.app",
+  "https://appzachedwardsllc.netlify.app",
+  "https://app.edwardszachllc.com",
+  "http://localhost:5173",
+  "http://localhost:3000",
+]);
+
+app.use(
+  cors({
+    origin(origin, cb) {
+      // Allow non-browser calls (no origin header)
+      if (!origin) return cb(null, true);
+      return cb(null, CORS_ALLOWLIST.has(origin));
+    },
+    credentials: false,
+  })
+);
 
 // 10mb JSON body limit
 app.use(express.json({ limit: "10mb" }));
@@ -12,8 +40,20 @@ app.use(express.json({ limit: "10mb" }));
 // -------------------------
 // ENV / CONFIG
 // -------------------------
-const { REDIS_URL, MEMORY_API_KEY_ADMIN, MEMORY_API_KEY_COACH, PORT } =
-  process.env;
+const {
+  REDIS_URL,
+  MEMORY_API_KEY_ADMIN,
+  MEMORY_API_KEY_COACH,
+  PORT,
+
+  // Portal auth (optional but required for OTP routes)
+  SMTP_HOST,
+  SMTP_PORT,
+  SMTP_USER,
+  SMTP_PASS,
+  SMTP_FROM,
+  JWT_SECRET,
+} = process.env;
 
 const REQUIRED = ["REDIS_URL", "MEMORY_API_KEY_ADMIN", "MEMORY_API_KEY_COACH"];
 const missing = REQUIRED.filter((k) => !process.env[k]);
@@ -41,6 +81,9 @@ const COACH_ALLOWED_WRITE_KEYS = new Set(COACH_ALLOWED_KEYS);
 
 // Redis key for user hash
 const userHashKey = (userId) => `mem:${userId}`;
+
+// Portal registry (so Jarvas can list all portal users)
+const PORTAL_USERS_INDEX_KEY = "portal_users:index"; // Redis SET of portal user ids
 
 // -------------------------
 // REDIS
@@ -78,6 +121,45 @@ function normalizePhone(phone) {
   return digits;
 }
 
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function portalUserIdFromEmail(email) {
+  // Using a dedicated namespace avoids colliding with your client:* ids.
+  return `portal:${normalizeEmail(email)}`;
+}
+
+function otpKey(email) {
+  return `otp:${normalizeEmail(email)}`;
+}
+
+function generateOtpCode() {
+  return String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+}
+
+function sha256(s) {
+  return crypto.createHash("sha256").update(String(s)).digest("hex");
+}
+
+// -------------------------
+// SMTP (Zoho) - used only by OTP routes
+// -------------------------
+function smtpConfigured() {
+  return Boolean(SMTP_HOST && SMTP_USER && SMTP_PASS && (SMTP_FROM || SMTP_USER));
+}
+
+const mailer = nodemailer.createTransport({
+  host: SMTP_HOST,
+  port: Number(SMTP_PORT || 587),
+  secure: false, // STARTTLS on 587
+  auth: {
+    user: SMTP_USER,
+    pass: SMTP_PASS,
+  },
+  requireTLS: true,
+});
+
 // -------------------------
 // AUTH: API KEY (admin/coach)
 // -------------------------
@@ -94,6 +176,27 @@ function requireApiKey(req, res, next) {
     return next();
   }
   return res.status(401).json({ error: "invalid_api_key" });
+}
+
+// -------------------------
+// AUTH: JWT (portal users)
+// -------------------------
+function requireJwt(req, res, next) {
+  try {
+    const auth = String(req.headers.authorization || "");
+    if (!auth.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "missing_bearer_token" });
+    }
+    if (!JWT_SECRET) {
+      return res.status(500).json({ error: "jwt_secret_not_configured" });
+    }
+    const token = auth.slice(7);
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.portal = payload; // { sub, email, ... }
+    return next();
+  } catch (e) {
+    return res.status(401).json({ error: "invalid_or_expired_token" });
+  }
 }
 
 // -------------------------
@@ -151,9 +254,156 @@ async function writeUserKeys(userId, updates, actor = "unknown") {
   }
 }
 
-// -------------------------
+// ============================================================================
+// PORTAL AUTH (OTP) — DOES NOT AFFECT EXISTING API KEY ROUTES
+// ============================================================================
+
+// Request a 6-digit login code via email
+app.post("/auth/request-code", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({ error: "invalid_email" });
+    }
+
+    if (!smtpConfigured()) {
+      return res.status(500).json({ error: "smtp_not_configured" });
+    }
+
+    await ensureRedis();
+
+    const code = generateOtpCode();
+    const codeHash = sha256(code);
+
+    // Store the hashed code for 10 minutes
+    await redis.set(otpKey(email), codeHash, { EX: 600 });
+
+    await mailer.sendMail({
+      from: SMTP_FROM || SMTP_USER,
+      to: email,
+      subject: "Your ZachFit login code",
+      text:
+        `Your ZachFit login code is: ${code}\n\n` +
+        `This code expires in 10 minutes.\n\n` +
+        `If you didn’t request this, you can ignore this email.`,
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /auth/request-code failed:", e);
+    return res.status(500).json({ error: "failed_to_send_code" });
+  }
+});
+
+// Verify code and issue JWT
+app.post("/auth/verify-code", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const code = String(req.body?.code || "").trim();
+
+    if (!email || !email.includes("@") || !code) {
+      return res.status(400).json({ error: "missing_email_or_code" });
+    }
+    if (!JWT_SECRET) {
+      return res.status(500).json({ error: "jwt_secret_not_configured" });
+    }
+
+    await ensureRedis();
+
+    const storedHash = await redis.get(otpKey(email));
+    if (!storedHash) {
+      return res.status(400).json({ error: "code_expired_or_not_found" });
+    }
+
+    const providedHash = sha256(code);
+    if (providedHash !== storedHash) {
+      return res.status(401).json({ error: "invalid_code" });
+    }
+
+    // Consume the OTP
+    await redis.del(otpKey(email));
+
+    const userId = portalUserIdFromEmail(email);
+
+    // Maintain a portal user registry so Jarvas can list all portal users
+    await redis.sAdd(PORTAL_USERS_INDEX_KEY, userId);
+
+    // Upsert a minimal profile record
+    const existing = await readUserMap(userId);
+    const createdAt = existing?.portal_meta?.created_at || nowIso();
+
+    await writeUserKeys(
+      userId,
+      {
+        portal_meta: {
+          email,
+          created_at: createdAt,
+          last_login_at: nowIso(),
+        },
+      },
+      "portal_auth"
+    );
+
+    const token = jwt.sign(
+      { sub: userId, email },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    return res.json({ ok: true, token, user_id: userId });
+  } catch (e) {
+    console.error("POST /auth/verify-code failed:", e);
+    return res.status(500).json({ error: "failed_to_verify_code" });
+  }
+});
+
+// Portal “me” endpoint (returns allowed keys from the portal user's namespace)
+app.get("/portal/me", requireJwt, async (req, res) => {
+  try {
+    const userId = String(req.portal?.sub || "");
+    if (!userId.startsWith("portal:")) {
+      return res.status(401).json({ error: "invalid_subject" });
+    }
+
+    const full = await readUserMap(userId);
+
+    // Reuse the same safe key list for now
+    const out = {};
+    for (const k of COACH_ALLOWED_KEYS) {
+      if (k in full) out[k] = full[k];
+    }
+
+    return res.json({
+      ok: true,
+      user_id: userId,
+      email: req.portal?.email || null,
+      data: out,
+    });
+  } catch (e) {
+    console.error("GET /portal/me failed:", e);
+    return res.status(503).json({ error: "memory_store_unavailable" });
+  }
+});
+
+// Admin: list all portal users (IDs only)
+// Uses existing admin API key to avoid exposing to clients.
+app.get("/admin/portal-users", requireApiKey, async (req, res) => {
+  if (req.apiRole !== "admin") {
+    return res.status(403).json({ error: "admin_only" });
+  }
+  try {
+    await ensureRedis();
+    const ids = await redis.sMembers(PORTAL_USERS_INDEX_KEY);
+    return res.json({ count: ids.length, user_ids: ids.sort() });
+  } catch (e) {
+    console.error("GET /admin/portal-users failed:", e);
+    return res.status(503).json({ error: "memory_store_unavailable" });
+  }
+});
+
+// ============================================================================
 // HEALTH
-// -------------------------
+// ============================================================================
 app.get("/healthz", async (req, res) => {
   try {
     await ensureRedis();
