@@ -142,7 +142,7 @@ function generateOtpCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-\1
+
 function sendgridConfigured() {
   return Boolean(SENDGRID_API_KEY && (OTP_FROM_EMAIL || SMTP_FROM));
 }
