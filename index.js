@@ -41,7 +41,7 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization", "x-api-key"],
   })
 );
-app.options(/.*/, cors());
+app.options("*", cors());
 
 // -------------------------
 // ENV / CONFIG
@@ -57,6 +57,10 @@ const {
   SMTP_USER,
   SMTP_PASS,
   SMTP_FROM,
+  // SendGrid (recommended on Render free tier)
+  SENDGRID_API_KEY,
+  OTP_FROM_EMAIL,
+  OTP_FROM_NAME,
 } = process.env;
 
 const REQUIRED = ["REDIS_URL", "MEMORY_API_KEY_ADMIN", "MEMORY_API_KEY_COACH"];
@@ -138,8 +142,15 @@ function generateOtpCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-function smtpConfigured() {
-  return Boolean(SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS && SMTP_FROM);
+\1
+function sendgridConfigured() {
+  return Boolean(SENDGRID_API_KEY && (OTP_FROM_EMAIL || SMTP_FROM));
+}
+
+function emailProvider() {
+  if (sendgridConfigured()) return "sendgrid";
+  if (smtpConfigured()) return "smtp";
+  return "none";
 }
 
 function jwtConfigured() {
@@ -162,11 +173,48 @@ function makeTransport() {
 }
 
 async function sendOtpEmail(toEmail, code) {
+  const fromEmail = OTP_FROM_EMAIL || SMTP_FROM;
+  const fromName = OTP_FROM_NAME || "ZachFit";
+
+  // Preferred: SendGrid Web API (HTTPS) — avoids SMTP port blocks on Render free tier
+  if (sendgridConfigured()) {
+    const subject = `${fromName} login code`;
+    const text = `Your ${fromName} login code is: ${code}
+
+This code expires in 10 minutes.`;
+
+    const payload = {
+      personalizations: [{ to: [{ email: toEmail }] }],
+      from: { email: fromEmail, name: fromName },
+      subject,
+      content: [{ type: "text/plain", value: text }],
+    };
+
+    const r = await fetch("https://api.sendgrid.com/v3/mail/send", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${SENDGRID_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      throw new Error(`SENDGRID_FAILED:${r.status}:${body}`);
+    }
+
+    return;
+  }
+
+  // Fallback: SMTP (useful for local dev / paid Render instances that allow SMTP ports)
   const transporter = makeTransport();
   if (!transporter) throw new Error("SMTP not configured");
 
-  const subject = "Your ZachFit login code";
-  const text = `Your ZachFit login code is: ${code}\n\nThis code expires in 10 minutes.`;
+  const subject = `${fromName} login code`;
+  const text = `Your ${fromName} login code is: ${code}
+
+This code expires in 10 minutes.`;
 
   await transporter.sendMail({
     from: SMTP_FROM,
@@ -282,6 +330,8 @@ app.get("/healthz", async (req, res) => {
       ok: true,
       at: nowIso(),
       build: BUILD_TAG,
+      email_provider: emailProvider(),
+      sendgrid_configured: sendgridConfigured(),
       smtp_configured: smtpConfigured(),
       jwt_configured: jwtConfigured(),
     });
@@ -291,7 +341,14 @@ app.get("/healthz", async (req, res) => {
 });
 
 app.get("/version", (req, res) => {
-  return res.json({ build: BUILD_TAG, at: nowIso() });
+  return res.json({
+    build: BUILD_TAG,
+    at: nowIso(),
+    email_provider: emailProvider(),
+    sendgrid_configured: sendgridConfigured(),
+    smtp_configured: smtpConfigured(),
+    jwt_configured: jwtConfigured(),
+  });
 });
 
 // ============================================================================
