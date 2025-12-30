@@ -41,7 +41,7 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization", "x-api-key"],
   })
 );
-app.options("*", cors());
+app.options(/.*/, cors());
 
 // -------------------------
 // ENV / CONFIG
