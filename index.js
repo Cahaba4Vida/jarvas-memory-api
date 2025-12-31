@@ -8,7 +8,7 @@ const nodemailer = require("nodemailer");
 const jwt = require("jsonwebtoken");
 const { createClient } = require("redis");
 
-const BUILD_TAG = "otp_portal_v1";
+const BUILD_TAG = "otp_portal_sendgrid_v3";
 
 const app = express();
 
@@ -41,7 +41,7 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization", "x-api-key"],
   })
 );
-app.options(/.*/, cors());
+app.options("/*", cors());
 
 // -------------------------
 // ENV / CONFIG
@@ -57,11 +57,22 @@ const {
   SMTP_USER,
   SMTP_PASS,
   SMTP_FROM,
-  // SendGrid (recommended on Render free tier)
-  SENDGRID_API_KEY,
-  OTP_FROM_EMAIL,
-  OTP_FROM_NAME,
 } = process.env;
+
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
+// Back-compat for earlier env naming
+const OTP_FROM_EMAIL = process.env.OTP_FROM_EMAIL || process.env.OTP_FROM || "";
+const OTP_FROM_NAME = process.env.OTP_FROM_NAME || "";
+
+const SENDGRID_FROM = process.env.SENDGRID_FROM || OTP_FROM_EMAIL || "";
+const EMAIL_FROM =
+  process.env.EMAIL_FROM || OTP_FROM_EMAIL || SMTP_FROM || SENDGRID_FROM || "";
+const FROM_NAME = process.env.FROM_NAME || OTP_FROM_NAME || "ZachFit";
+
+function sendgridConfigured() {
+  return Boolean(SENDGRID_API_KEY && (SENDGRID_FROM || EMAIL_FROM));
+}
+
 
 const REQUIRED = ["REDIS_URL", "MEMORY_API_KEY_ADMIN", "MEMORY_API_KEY_COACH"];
 const missing = REQUIRED.filter((k) => !process.env[k]);
@@ -97,7 +108,23 @@ const portalUsersSetKey = "portal_users";
 // -------------------------
 // REDIS
 // -------------------------
-const redis = createClient({ url: REDIS_URL });
+const REDIS_TLS = String(process.env.REDIS_TLS || "").toLowerCase() === "true";
+const _redisSocket = {
+  connectTimeout: Number(process.env.REDIS_CONNECT_TIMEOUT_MS || 10000),
+};
+if (
+  (REDIS_URL || "").toLowerCase().startsWith("rediss://") ||
+  REDIS_TLS === true
+) {
+  _redisSocket.tls = true;
+  // Redis Enterprise Cloud commonly requires TLS, and most clients don't need strict CA pinning.
+  // If you want strict verification, set REDIS_TLS_REJECT_UNAUTHORIZED=true
+  _redisSocket.rejectUnauthorized =
+    String(process.env.REDIS_TLS_REJECT_UNAUTHORIZED || "").toLowerCase() ===
+    "true";
+}
+const redis = createClient({ url: REDIS_URL, socket: _redisSocket });
+
 redis.on("error", (err) => console.error("Redis error:", err));
 
 async function ensureRedis() {
@@ -142,15 +169,12 @@ function generateOtpCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-
-function sendgridConfigured() {
-  return Boolean(SENDGRID_API_KEY && (OTP_FROM_EMAIL || SMTP_FROM));
+function smtpConfigured() {
+  return Boolean(SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS && SMTP_FROM);
 }
 
-function emailProvider() {
-  if (sendgridConfigured()) return "sendgrid";
-  if (smtpConfigured()) return "smtp";
-  return "none";
+function emailConfigured() {
+  return sendgridConfigured() || smtpConfigured();
 }
 
 function jwtConfigured() {
@@ -158,70 +182,80 @@ function jwtConfigured() {
 }
 
 // -------------------------
-// MAILER (Zoho SMTP)
+// MAILER (SendGrid preferred, SMTP fallback)
 // -------------------------
-function makeTransport() {
-  if (!smtpConfigured()) return null;
-  const portNum = parseInt(String(SMTP_PORT), 10);
-  const secure = portNum === 465;
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: portNum,
-    secure,
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
-  });
-}
-
-async function sendOtpEmail(toEmail, code) {
-  const fromEmail = OTP_FROM_EMAIL || SMTP_FROM;
-  const fromName = OTP_FROM_NAME || "ZachFit";
-
-  // Preferred: SendGrid Web API (HTTPS) — avoids SMTP port blocks on Render free tier
+async function sendEmail({ to, subject, text, html }) {
   if (sendgridConfigured()) {
-    const subject = `${fromName} login code`;
-    const text = `Your ${fromName} login code is: ${code}
-
-This code expires in 10 minutes.`;
-
-    const payload = {
-      personalizations: [{ to: [{ email: toEmail }] }],
-      from: { email: fromEmail, name: fromName },
-      subject,
-      content: [{ type: "text/plain", value: text }],
-    };
-
-    const r = await fetch("https://api.sendgrid.com/v3/mail/send", {
+    const fromEmail = SENDGRID_FROM || EMAIL_FROM;
+    const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${SENDGRID_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email: to }] }],
+        from: { email: fromEmail, name: FROM_NAME },
+        subject,
+        content: [
+          { type: "text/plain", value: text || " " },
+          ...(html ? [{ type: "text/html", value: html }] : []),
+        ],
+      }),
     });
-
-    if (!r.ok) {
-      const body = await r.text().catch(() => "");
-      throw new Error(`SENDGRID_FAILED:${r.status}:${body}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      const err = new Error(`sendgrid_failed_${res.status}`);
+      err.details = body.slice(0, 300);
+      throw err;
     }
-
     return;
   }
 
-  // Fallback: SMTP (useful for local dev / paid Render instances that allow SMTP ports)
-  const transporter = makeTransport();
-  if (!transporter) throw new Error("SMTP not configured");
-
-  const subject = `${fromName} login code`;
-  const text = `Your ${fromName} login code is: ${code}
-
-This code expires in 10 minutes.`;
-
+  // SMTP fallback
+  if (!emailConfigured()) {
+    const err = new Error("email_not_configured");
+    err.code = "email_not_configured";
+    throw err;
+  }
+  const portNum = parseInt(String(SMTP_PORT), 10);
+  const secure = portNum === 465;
+  const transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: portNum,
+    secure,
+    auth: { user: SMTP_USER, pass: SMTP_PASS },
+  });
   await transporter.sendMail({
     from: SMTP_FROM,
-    to: toEmail,
+    to,
     subject,
-    text,
+    text: text || " ",
+    ...(html ? { html } : {}),
   });
+}
+
+async function sendOtpEmail(toEmail, code) {
+  if (!emailConfigured()) {
+    const err = new Error("email_not_configured");
+    err.code = "email_not_configured";
+    throw err;
+  }
+  const subject = `Your ZachFit login code: ${code}`;
+  const text = `Your ZachFit login code is: ${code}
+
+This code expires in 10 minutes.`;
+  const html = `
+    <div style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; line-height: 1.4;">
+      <h2 style="margin:0 0 12px 0;">ZachFit login code</h2>
+      <p style="margin:0 0 12px 0;">Use this code to finish logging in:</p>
+      <div style="font-size:28px; font-weight:700; letter-spacing: 3px; padding: 12px 16px; border:1px solid #ddd; display:inline-block; border-radius:10px;">
+        ${code}
+      </div>
+      <p style="margin:16px 0 0 0; color:#666;">Expires in 10 minutes.</p>
+    </div>
+  `;
+  await sendEmail({ to: toEmail, subject, text, html });
 }
 
 // -------------------------
@@ -323,6 +357,11 @@ async function writeUserKeys(userId, updates, actor = "unknown") {
 // -------------------------
 // HEALTH / VERSION
 // -------------------------
+// Lightweight liveness check (does NOT touch Redis)
+app.get("/alive", (req, res) => {
+  return res.json({ ok: true, at: nowIso(), build: BUILD_TAG });
+});
+
 app.get("/healthz", async (req, res) => {
   try {
     await ensureRedis();
@@ -330,25 +369,22 @@ app.get("/healthz", async (req, res) => {
       ok: true,
       at: nowIso(),
       build: BUILD_TAG,
-      email_provider: emailProvider(),
-      sendgrid_configured: sendgridConfigured(),
       smtp_configured: smtpConfigured(),
       jwt_configured: jwtConfigured(),
     });
-  } catch {
-    return res.status(503).json({ ok: false, build: BUILD_TAG });
+  } catch (err) {
+    return res.status(503).json({
+      ok: false,
+      at: nowIso(),
+      build: BUILD_TAG,
+      // Useful for debugging in PowerShell without leaking secrets
+      error: String(err?.message || "redis_unavailable"),
+    });
   }
 });
 
 app.get("/version", (req, res) => {
-  return res.json({
-    build: BUILD_TAG,
-    at: nowIso(),
-    email_provider: emailProvider(),
-    sendgrid_configured: sendgridConfigured(),
-    smtp_configured: smtpConfigured(),
-    jwt_configured: jwtConfigured(),
-  });
+  return res.json({ build: BUILD_TAG, at: nowIso() });
 });
 
 // ============================================================================
@@ -357,8 +393,8 @@ app.get("/version", (req, res) => {
 
 app.post("/auth/request-code", async (req, res) => {
   try {
-    if (!smtpConfigured()) {
-      return res.status(500).json({ error: "smtp_not_configured" });
+    if (!emailConfigured()) {
+      return res.status(500).json({ error: "email_not_configured" });
     }
 
     const email = normalizeEmail(req.body?.email);
